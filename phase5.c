@@ -17,6 +17,7 @@
 #include <vm.h>
 #include <string.h>
 
+extern int debugflag;
 extern void mbox_create(systemArgs *args_ptr);
 extern void mbox_release(systemArgs *args_ptr);
 extern void mbox_send(systemArgs *args_ptr);
@@ -40,15 +41,21 @@ FaultHandler(int  type,  // USLOSS_MMU_INT
              void *arg); // Offset within VM region
 
 static void vmInit(systemArgs *sysargsPtr);
+static void * vmInitReal(int mappings, int pages, int frames, int pagers);
 static void vmDestroy(systemArgs *sysargsPtr);
-
+static void vmDestroyReal(void);
+static  int  Pager(char *);
 
 
 // added structures
 extern int start5 (char *);
 int vmInitialized = 0;
+int faultMboxID;
+int pagersPID[MAXPAGERS]; // pagersID[i] = -1 for i >= acutal # of pagers
+FTE* frameTable;
 
 // added functions
+int findFreeFrame();
 
 
 
@@ -125,6 +132,29 @@ static void
 vmInit(systemArgs *sysargsPtr)
 {
     CheckMode();
+    
+    // return -2 if already intialized
+    if (vmInitialized)
+    {
+        sysargsPtr->arg4 = (void *) -2;
+        return;
+    }
+    
+    // return -1 if given invalid input
+    if (sysargsPtr->arg1 != sysargsPtr->arg2)
+    {
+        sysargsPtr->arg4 = (void *) -1;
+        return;
+    }
+    
+    // call real helper
+    sysargsPtr->arg1 = vmInitReal((long)sysargsPtr->arg1, (long)sysargsPtr->arg2, (long)sysargsPtr->arg3, (long)sysargsPtr->arg4);
+    
+    sysargsPtr->arg4 = (void *) 0;
+    
+    // set flag to indicate intialized
+    vmInitialized = 1;
+    
 } /* vmInit */
 
 
@@ -147,7 +177,8 @@ vmInit(systemArgs *sysargsPtr)
 static void
 vmDestroy(systemArgs *sysargsPtr)
 {
-   CheckMode();
+    CheckMode();
+    vmDestroyReal();
 } /* vmDestroy */
 
 
@@ -175,34 +206,73 @@ vmInitReal(int mappings, int pages, int frames, int pagers)
     int dummy;
     int i;
 
-   CheckMode();
-   status = USLOSS_MmuInit(mappings, pages, frames);
-   if (status != USLOSS_MMU_OK) {
-      USLOSS_Console("vmInitReal: couldn't init MMU, status %d\n", status);
-      abort();
-   }
+    CheckMode();
+    // initialize the MMU
+    status = USLOSS_MmuInit(mappings, pages, frames);
+    if (status != USLOSS_MMU_OK) {
+        USLOSS_Console("vmInitReal: couldn't init MMU, status %d\n", status);
+        abort();
+    }
+    
+    // install handler
     USLOSS_IntVec[USLOSS_MMU_INT] = FaultHandler;
 
 
    /*
-    * Initialize page tables.
+    * Initialize proc table
     */
     for (i = 0; i < MAXPROC; i++)
     {
         Process *aProc = malloc(sizeof(Process));
         aProc->numPages = 0;
         aProc->pageTable = malloc(pages * sizeof(PTE));
+        
+        // initialize page table for this process
+        int j;
+        for (j = 0; j < pages; j++)
+        {
+            aProc->pageTable[j].state = UNUSED;
+            aProc->pageTable[j].frame = -1;
+            aProc->pageTable[j].diskBlock = -1;
+        }
+        
         aProc->privateMboxID = MboxCreate(0, 0);
         processes[i] = *aProc;
     }
+    
+    /*
+     * Initialize frame table
+     */
+    frameTable = malloc(frames * sizeof(FTE));
+    for (i = 0; i < frames; i++)
+    {
+        frameTable[i].pid = -1;
+        frameTable[i].page = -1;
+        frameTable[i].referenced = 0;
+        frameTable[i].clean = 1;
+        frameTable[i].state = UNUSED;
+    }
+    
 
    /*
     * Create the fault mailbox.
     */
+    faultMboxID = MboxCreate(MAXPROC, sizeof(FaultMsg));
 
    /*
     * Fork the pagers.
     */
+    for (i = 0; i < MAXPAGERS; i++)
+    {
+        pagersPID[i] = -1;
+        if (i < pagers)
+        {
+            char nameBuf[10];
+            sprintf(nameBuf, "Pager%d", i + 1);
+            pagersPID[i] = fork1(nameBuf, Pager, NULL, USLOSS_MIN_STACK, PAGER_PRIORITY);
+        }
+            
+    }
     
    /*
     * Zero out, then initialize, the vmStats structure
@@ -213,9 +283,8 @@ vmInitReal(int mappings, int pages, int frames, int pagers)
    /*
     * Initialize other vmStats fields.
     */
-    vmInitialized = 1;
-
-   return USLOSS_MmuRegion(&dummy);
+    
+    return USLOSS_MmuRegion(&dummy);
 } /* vmInitReal */
 
 
@@ -309,17 +378,25 @@ static void
 FaultHandler(int  type /* USLOSS_MMU_INT */,
              void *arg  /* Offset within VM region */)
 {
-   int cause;
-
-
-   assert(type == USLOSS_MMU_INT);
-   cause = USLOSS_MmuGetCause();
-   assert(cause == USLOSS_MMU_FAULT);
-   vmStats.faults++;
+    int cause;
+    assert(type == USLOSS_MMU_INT);
+    cause = USLOSS_MmuGetCause();
+    assert(cause == USLOSS_MMU_FAULT);
+    vmStats.faults++;
+    
    /*
     * Fill in faults[pid % MAXPROC], send it to the pagers, and wait for the
     * reply.
     */
+    int pid = getpid();
+    faults[pid % MAXPROC].pid = pid;
+    faults[pid % MAXPROC].addr = arg;
+    faults[pid % MAXPROC].replyMbox = processes[pid % MAXPROC].privateMboxID;
+    
+    MboxSend(faultMboxID, & faults[pid % MAXPROC], sizeof(FaultMsg));
+    
+    MboxReceive(processes[pid % MAXPROC].privateMboxID, NULL, 0);
+    
 } /* FaultHandler */
 
 /*
@@ -342,11 +419,78 @@ Pager(char *buf)
 {
     while(1) {
         /* Wait for fault to occur (receive from mailbox) */
+        FaultMsg aFaultMsg;
+        MboxReceive(faultMboxID, &aFaultMsg, sizeof(FaultMsg));
+        
+        if (debugflag)
+            USLOSS_Console("Pager(): received a FaultMsg\n");
+        
+        int frameIndex;
         /* Look for free frame */
+        frameIndex = findFreeFrame();
+        if (debugflag)
+            USLOSS_Console("Pager(): found a free frame %d\n", frameIndex);
+        
         /* If there isn't one then use clock algorithm to
          * replace a page (perhaps write to disk) */
+        if (frameIndex < 0)
+            ;
+        
         /* Load page into frame from disk, if necessary */
+        
+        /* Zero out a new touched page, if necessary */
+        // figure out which page this process is using
+        int pageIndex = (int) ((long)aFaultMsg.addr / USLOSS_MmuPageSize());
+        if (debugflag)
+            USLOSS_Console("Pager(): blocked process is trying to access page %d\n", pageIndex);
+        // if this page is not touched yet
+        if (processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].state == UNUSED)
+        {
+            if (debugflag)
+                USLOSS_Console("Pager(): this page is not used yet\n");
+            USLOSS_MmuMap(TAG, pageIndex, frameIndex, USLOSS_MMU_PROT_RW);
+            int offset = pageIndex * USLOSS_MmuPageSize();
+            int dummy;
+            // zero out this page
+            memset(USLOSS_MmuRegion(&dummy) + offset, '\0', USLOSS_MmuPageSize());
+            USLOSS_MmuUnmap(TAG, pageIndex);
+        }
+        
+        /* Update frame table, page table and process table */
+        frameTable[frameIndex].pid = aFaultMsg.pid;
+        frameTable[frameIndex].page = pageIndex;
+        frameTable[frameIndex].referenced = 0;
+        frameTable[frameIndex].clean = 1;
+        frameTable[frameIndex].state = INCORE;
+        processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].state = INCORE;
+        processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].frame = frameIndex;
+        processes[aFaultMsg.pid % MAXPROC].numPages++;
+        
         /* Unblock waiting (faulting) process */
+        MboxSend(aFaultMsg.replyMbox, NULL, 0);
+        
     }
     return 0;
 } /* Pager */
+
+
+/*
+ *----------------------------------------------------------------------
+ * findFrame
+ * 
+ * Find a free frame
+ *
+ * Return index of that frame in the frameTable
+ *----------------------------------------------------------------------
+ */
+int findFreeFrame()
+{
+    int i;
+    
+    for (i = 0; i < vmStats.frames; i++)
+    {
+        if (frameTable[i].state == UNUSED)
+            return i;
+    }
+    return -1;
+}

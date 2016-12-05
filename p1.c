@@ -1,7 +1,11 @@
 #include "vm.h"
+#include "phase5.h"
 #include "usloss.h"
 #define DEBUG 0
+
+extern int vmInitialized;
 extern int debugflag;
+extern Process processes[MAXPROC];
 
 void
 p1_fork(int pid)
@@ -23,6 +27,30 @@ p1_switch(int old, int new)
     
     if (DEBUG && debugflag)
         USLOSS_Console("p1_switch(): vmInitialized = %d\n", vmInitialized);
+    
+    if (vmInitialized)
+    {
+        int i;
+        
+        // unload old pages
+        for (i = 0; i < vmStats.pages; i++)
+        {
+            if (processes[old].pageTable[i].state == INCORE ||
+                processes[old].pageTable[i].state == INDISK)
+            {
+                USLOSS_MmuUnmap(TAG, i);
+            }
+        }
+        
+        // load new pages
+        for (i = 0; i < vmStats.pages; i++)
+        {
+            if (processes[new].pageTable[i].state == INCORE)
+                USLOSS_MmuMap(TAG, i, processes[new].pageTable[i].frame, USLOSS_MMU_PROT_RW);
+        }
+        
+        
+    }
 } /* p1_switch */
 
 void
