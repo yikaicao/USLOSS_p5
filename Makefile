@@ -44,7 +44,7 @@ $(TESTS):	$(TARGET)
 	$(CC) $(LDFLAGS) -o $@ $@.o $(LIBS)
 
 clean:
-	rm -f $(COBJS) $(TARGET) simple?.o simple?  term[0-3].out disk[01]
+	rm -f $(COBJS) $(TARGET) simple?.o simple?  term[0-3].out disk[01] simple?.txt
 
 submit: $(CSRCS) $(HDRS)
 	tar cvzf phase5.tgz $(CSRCS) $(HDRS) Makefile

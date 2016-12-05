@@ -301,7 +301,6 @@ FaultHandler(int  type /* USLOSS_MMU_INT */,
 {
    int cause;
 
-   int offset = (int) (long) arg;
 
    assert(type == USLOSS_MMU_INT);
    cause = USLOSS_MmuGetCause();
