@@ -1,4 +1,4 @@
-
+#include "vm.h"
 #include "usloss.h"
 #define DEBUG 0
 extern int debugflag;
@@ -20,6 +20,9 @@ p1_switch(int old, int new)
 {
     if (DEBUG && debugflag)
         USLOSS_Console("p1_switch() called: old = %d, new = %d\n", old, new);
+    
+    if (DEBUG && debugflag)
+        USLOSS_Console("p1_switch(): vmInitialized = %d\n", vmInitialized);
 } /* p1_switch */
 
 void

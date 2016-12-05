@@ -46,7 +46,7 @@ static void vmDestroy(systemArgs *sysargsPtr);
 
 // added structures
 extern int start5 (char *);
-
+int vmInitialized = 0;
 
 // added functions
 
@@ -171,8 +171,9 @@ vmDestroy(systemArgs *sysargsPtr)
 void *
 vmInitReal(int mappings, int pages, int frames, int pagers)
 {
-   int status;
-   int dummy;
+    int status;
+    int dummy;
+    int i;
 
    CheckMode();
    status = USLOSS_MmuInit(mappings, pages, frames);
@@ -180,30 +181,39 @@ vmInitReal(int mappings, int pages, int frames, int pagers)
       USLOSS_Console("vmInitReal: couldn't init MMU, status %d\n", status);
       abort();
    }
-   USLOSS_IntVec[USLOSS_MMU_INT] = FaultHandler;
+    USLOSS_IntVec[USLOSS_MMU_INT] = FaultHandler;
 
 
    /*
     * Initialize page tables.
     */
+    for (i = 0; i < MAXPROC; i++)
+    {
+        Process *aProc = malloc(sizeof(Process));
+        aProc->numPages = 0;
+        aProc->pageTable = malloc(pages * sizeof(PTE));
+        aProc->privateMboxID = MboxCreate(0, 0);
+        processes[i] = *aProc;
+    }
 
-   /* 
+   /*
     * Create the fault mailbox.
     */
 
    /*
     * Fork the pagers.
     */
-
+    
    /*
     * Zero out, then initialize, the vmStats structure
     */
-   memset((char *) &vmStats, 0, sizeof(VmStats));
-   vmStats.pages = pages;
-   vmStats.frames = frames;
+    memset((char *) &vmStats, 0, sizeof(VmStats));
+    vmStats.pages = pages;
+    vmStats.frames = frames;
    /*
     * Initialize other vmStats fields.
     */
+    vmInitialized = 1;
 
    return USLOSS_MmuRegion(&dummy);
 } /* vmInitReal */

@@ -1,6 +1,7 @@
 /*
  * vm.h
  */
+extern int vmInitialized;
 
 
 /*
@@ -33,6 +34,7 @@ typedef struct Process {
     int  numPages;   // Size of the page table.
     PTE  *pageTable; // The page table for the process.
     // Add more stuff here */
+    int privateMboxID;
 } Process;
 
 /*
