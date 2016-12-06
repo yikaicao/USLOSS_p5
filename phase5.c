@@ -54,9 +54,14 @@ int vmInitialized = 0;
 int faultMboxID;
 int pagersPID[MAXPAGERS]; // pagersID[i] = -1 for i >= acutal # of pagers
 FTE* frameTable;
+int clockHand;
 
 // added functions
 int findFreeFrame();
+int findUnreferencedFrame();
+void printFrameTable();
+void printPageTable(int pid);
+
 
 
 
@@ -244,6 +249,7 @@ vmInitReal(int mappings, int pages, int frames, int pagers)
     /*
      * Initialize frame table
      */
+    clockHand = 0;
     frameTable = malloc(frames * sizeof(FTE));
     for (i = 0; i < frames; i++)
     {
@@ -458,7 +464,9 @@ Pager(char *buf)
             MboxSend(aFaultMsg.replyMbox, NULL, 0);
             break;
         }
-            
+        
+        // figure out which page this process is using
+        int pageIndex = (int) ((long)aFaultMsg.addr / USLOSS_MmuPageSize());
         
         int frameIndex;
         /* Look for free frame */
@@ -466,22 +474,35 @@ Pager(char *buf)
         if (frameIndex >= 0)
         {
             if (debugflag)
-                USLOSS_Console("Pager(): found a free frame %d\n", frameIndex);
+                USLOSS_Console("Pager(): found free frame %d\n", frameIndex);
             vmStats.freeFrames--;
         }
         
         /* If there isn't one then use clock algorithm to
          * replace a page (perhaps write to disk) */
         if (frameIndex < 0)
-            ;
+        {
+            if (debugflag)
+                USLOSS_Console("Pager(): didn't find a free frame\n");
+            
+            
+            // find an unreferenced frame
+            frameIndex = findUnreferencedFrame();
+            if (debugflag)
+                USLOSS_Console("Pager(): found unreferenced frame %d\n", frameIndex);
+            
+            // write to disk if necessary
+            
+            // update old page table
+            if (debugflag)
+                USLOSS_Console("Pager(): update process %d's page %d\n",
+                           frameTable[frameIndex].pid,
+                           frameTable[frameIndex].page
+                           );
+            processes[frameTable[frameIndex].pid].pageTable[frameTable[frameIndex].page].state = UNMAPPED;
+            
+        }
         
-        /* Load page into frame from disk, if necessary */
-        
-        /* Zero out a new touched page, if necessary */
-        // figure out which page this process is using
-        int pageIndex = (int) ((long)aFaultMsg.addr / USLOSS_MmuPageSize());
-        if (debugflag)
-            USLOSS_Console("Pager(): blocked process is trying to access page %d\n", pageIndex);
         // if this page is not touched yet
         if (processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].state == UNUSED)
         {
@@ -495,8 +516,15 @@ Pager(char *buf)
             memset(USLOSS_MmuRegion(&dummy) + offset, '\0', USLOSS_MmuPageSize());
             USLOSS_MmuUnmap(TAG, pageIndex);
         }
+        else
+        {
+            // load page into frame from disk if necessary
+        }
         
-        /* Update frame table, page table and process table */
+        // set to unreferenced and clean
+        USLOSS_MmuSetAccess(frameIndex, 0);
+        
+        /* Update frame table, new page table and process table */
         frameTable[frameIndex].pid = aFaultMsg.pid;
         frameTable[frameIndex].page = pageIndex;
         frameTable[frameIndex].referenced = 0;
@@ -525,12 +553,58 @@ Pager(char *buf)
  */
 int findFreeFrame()
 {
-    int i;
+    if (debugflag)
+        USLOSS_Console("findFreeFrame(): finding in %d frames\n", vmStats.frames);
     
+    int i, accessBit;
     for (i = 0; i < vmStats.frames; i++)
     {
+        if (debugflag)
+            USLOSS_Console("findFreeFrame(): slot %d in frameTable has state %d\n", i, frameTable[i].state);
         if (frameTable[i].state == UNUSED)
+        {
+            USLOSS_MmuGetAccess(i, &accessBit);
+            if (debugflag)
+                USLOSS_Console("findFreeFrame(): ref = %d\n", accessBit & USLOSS_MMU_REF);
+            
             return i;
+        }
+    }
+    return -1;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ * findUnreferencedFrame
+ * 
+ * Side effects:
+ * None.
+ *----------------------------------------------------------------------
+ */
+int findUnreferencedFrame()
+{
+    int accessBit;
+    
+    // iterate two times of frames at most
+    for (;; clockHand = (clockHand + 1) % vmStats.frames)
+    {
+        // get access bit
+        USLOSS_MmuGetAccess(clockHand, &accessBit);
+        
+        // if referenced
+        if (accessBit & USLOSS_MMU_REF)
+        {
+            // only preserves dirty bit
+            accessBit = accessBit & USLOSS_MMU_DIRTY;
+            
+            // set to unreferenced
+            USLOSS_MmuSetAccess(clockHand % vmStats.frames, accessBit);
+        }
+        else
+        {
+            return clockHand % vmStats.frames;
+        }
     }
     return -1;
 }
@@ -543,11 +617,12 @@ int findFreeFrame()
  */
 void printFrameTable()
 {
-    int i;
+    int i, accessBit;
     for (i = 0; i < vmStats.frames; i++)
     {
-        USLOSS_Console("\tprintFrameTable(): frame %d pid %d page %d referenced %d clean %d state %d\n",
-                       i, frameTable[i].pid, frameTable[i].page, frameTable[i].referenced, frameTable[i].clean, frameTable[i].state);
+        USLOSS_MmuGetAccess(i, &accessBit);
+        USLOSS_Console("\tprintFrameTable(): frame %d pid %d page %d ref %d clean %d state %d\n",
+                       i, frameTable[i].pid, frameTable[i].page, accessBit & USLOSS_MMU_REF, frameTable[i].clean, frameTable[i].state);
     }
 }
 
@@ -562,8 +637,12 @@ void printPageTable(int pid)
     
     int i;
     for (i = 0; i < vmStats.pages; i++)
-        USLOSS_Console("\t\tpage %d stored at %d in block %d state %d\n", i,
+    {
+        USLOSS_Console("\t\tpage %d stored at frame %d in block %d state %d\n", i,
                        processes[pid % MAXPROC].pageTable[i].frame,
                        processes[pid % MAXPROC].pageTable[i].diskBlock,
-                       processes[pid % MAXPROC].pageTable[i].state);
+                       processes[pid % MAXPROC].pageTable[i].state
+                       );
+        
+    }
 }
