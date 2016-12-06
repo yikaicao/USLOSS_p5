@@ -24,6 +24,7 @@ extern void mbox_send(systemArgs *args_ptr);
 extern void mbox_receive(systemArgs *args_ptr);
 extern void mbox_condsend(systemArgs *args_ptr);
 extern void mbox_condreceive(systemArgs *args_ptr);
+extern int diskSizeReal(int, int*, int*, int*);
 
 Process processes[MAXPROC];  // phase 5 process table
 
@@ -253,6 +254,18 @@ vmInitReal(int mappings, int pages, int frames, int pagers)
         frameTable[i].state = UNUSED;
     }
     
+    /*
+     * Initialize disk table
+     */
+    int sector, track, disk;
+    diskSizeReal(1, &sector, &track, &disk);
+    vmStats.diskBlocks = sector * track * disk / USLOSS_MmuPageSize();
+    if (debugflag)
+    {
+        USLOSS_Console("vmInitReal(): sector %d track %d disk %d\n", sector, track, disk);
+        USLOSS_Console("vmInitReal(): disk has %d disk blocks\n", vmStats.diskBlocks);
+    }
+    
 
    /*
     * Create the fault mailbox.
@@ -280,6 +293,9 @@ vmInitReal(int mappings, int pages, int frames, int pagers)
     memset((char *) &vmStats, 0, sizeof(VmStats));
     vmStats.pages = pages;
     vmStats.frames = frames;
+    vmStats.freeFrames = frames;
+    vmStats.diskBlocks = sector * track * disk / USLOSS_MmuPageSize();
+    vmStats.freeDiskBlocks = sector * track * disk / USLOSS_MmuPageSize();
    /*
     * Initialize other vmStats fields.
     */
@@ -346,13 +362,25 @@ vmDestroyReal(void)
    /*
     * Kill the pagers here.
     */
+    int i;
+    for (i = 0; i < MAXPAGERS; i++)
+    {
+        // if this pager exist
+        if (pagersPID[i] != -1)
+        {
+            int pid = getpid();
+            faults[pid % MAXPROC].pid = -1; // to indicate zapping pager
+            faults[pid % MAXPROC].replyMbox = processes[pid % MAXPROC].privateMboxID;
+            MboxSend(faultMboxID, &faults[pid % MAXPROC], sizeof(FaultMsg));
+            MboxReceive(processes[pid % MAXPROC].privateMboxID, NULL, 0);
+        }
+    }
+    
    /* 
     * Print vm statistics.
     */
-   USLOSS_Console("vmStats:\n");
-   USLOSS_Console("pages: %d\n", vmStats.pages);
-   USLOSS_Console("frames: %d\n", vmStats.frames);
-   USLOSS_Console("blocks: %d\n", vmStats.diskBlocks);
+    vmStats.freeFrames = vmStats.frames;
+    PrintStats();
    /* and so on... */
 
 } /* vmDestroyReal */
@@ -393,7 +421,7 @@ FaultHandler(int  type /* USLOSS_MMU_INT */,
     faults[pid % MAXPROC].addr = arg;
     faults[pid % MAXPROC].replyMbox = processes[pid % MAXPROC].privateMboxID;
     
-    MboxSend(faultMboxID, & faults[pid % MAXPROC], sizeof(FaultMsg));
+    MboxSend(faultMboxID, &faults[pid % MAXPROC], sizeof(FaultMsg));
     
     MboxReceive(processes[pid % MAXPROC].privateMboxID, NULL, 0);
     
@@ -425,11 +453,22 @@ Pager(char *buf)
         if (debugflag)
             USLOSS_Console("Pager(): received a FaultMsg\n");
         
+        if (aFaultMsg.pid == -1)
+        {
+            MboxSend(aFaultMsg.replyMbox, NULL, 0);
+            break;
+        }
+            
+        
         int frameIndex;
         /* Look for free frame */
         frameIndex = findFreeFrame();
-        if (debugflag)
-            USLOSS_Console("Pager(): found a free frame %d\n", frameIndex);
+        if (frameIndex >= 0)
+        {
+            if (debugflag)
+                USLOSS_Console("Pager(): found a free frame %d\n", frameIndex);
+            vmStats.freeFrames--;
+        }
         
         /* If there isn't one then use clock algorithm to
          * replace a page (perhaps write to disk) */
@@ -446,6 +485,7 @@ Pager(char *buf)
         // if this page is not touched yet
         if (processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].state == UNUSED)
         {
+            vmStats.new++;
             if (debugflag)
                 USLOSS_Console("Pager(): this page is not used yet\n");
             USLOSS_MmuMap(TAG, pageIndex, frameIndex, USLOSS_MMU_PROT_RW);
@@ -493,4 +533,37 @@ int findFreeFrame()
             return i;
     }
     return -1;
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ * printFrameTable
+ *----------------------------------------------------------------------
+ */
+void printFrameTable()
+{
+    int i;
+    for (i = 0; i < vmStats.frames; i++)
+    {
+        USLOSS_Console("\tprintFrameTable(): frame %d pid %d page %d referenced %d clean %d state %d\n",
+                       i, frameTable[i].pid, frameTable[i].page, frameTable[i].referenced, frameTable[i].clean, frameTable[i].state);
+    }
+}
+
+/*
+ *----------------------------------------------------------------------
+ * printPageTable
+ *----------------------------------------------------------------------
+ */
+void printPageTable(int pid)
+{
+    USLOSS_Console("\tprintPageTable(): for process %d, it has:\n", pid);
+    
+    int i;
+    for (i = 0; i < vmStats.pages; i++)
+        USLOSS_Console("\t\tpage %d stored at %d in block %d state %d\n", i,
+                       processes[pid % MAXPROC].pageTable[i].frame,
+                       processes[pid % MAXPROC].pageTable[i].diskBlock,
+                       processes[pid % MAXPROC].pageTable[i].state);
 }

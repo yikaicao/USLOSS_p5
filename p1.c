@@ -6,6 +6,8 @@
 extern int vmInitialized;
 extern int debugflag;
 extern Process processes[MAXPROC];
+extern void printFrameTable();
+extern void printPageTable(int pid);
 
 void
 p1_fork(int pid)
@@ -31,12 +33,12 @@ p1_switch(int old, int new)
     if (vmInitialized)
     {
         int i;
+        vmStats.switches++;
         
         // unload old pages
         for (i = 0; i < vmStats.pages; i++)
         {
-            if (processes[old].pageTable[i].state == INCORE ||
-                processes[old].pageTable[i].state == INDISK)
+            if (processes[old].pageTable[i].frame != -1)
             {
                 USLOSS_MmuUnmap(TAG, i);
             }

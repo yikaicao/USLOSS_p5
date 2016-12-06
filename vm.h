@@ -57,7 +57,6 @@ typedef struct FaultMsg {
     void *addr;      // Address that caused the fault.
     int  replyMbox;  // Mailbox to send reply.
     // Add more stuff here.
-    int zapPager;  // is set to 0 if need to zap a pager
 } FaultMsg;
 
 #define CheckMode() assert(USLOSS_PsrGet() & USLOSS_PSR_CURRENT_MODE)
