@@ -12,7 +12,7 @@
  */
 #define UNUSED 500
 #define INCORE 501
-#define INDISK 502
+#define ONDISK 502
 #define UNMAPPED 503
 /* You'll probably want more states */
 
@@ -37,6 +37,14 @@ typedef struct FTE {
     int clean;
     int state;
 } FTE;
+
+/*
+ * Disk table entry.
+ */
+typedef struct DTE {
+    int pid;
+    int page;
+} DTE;
 
 
 /*

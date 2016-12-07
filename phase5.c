@@ -25,6 +25,8 @@ extern void mbox_receive(systemArgs *args_ptr);
 extern void mbox_condsend(systemArgs *args_ptr);
 extern void mbox_condreceive(systemArgs *args_ptr);
 extern int diskSizeReal(int, int*, int*, int*);
+extern int diskWriteReal(int, int, int, int, void*);
+extern int diskReadReal(int, int, int, int, void*);
 
 Process processes[MAXPROC];  // phase 5 process table
 
@@ -36,7 +38,6 @@ FaultMsg faults[MAXPROC]; /* Note that a process can have only
                            * and index them by pid. */
 VmStats  vmStats;
 
-
 static void
 FaultHandler(int  type,  // USLOSS_MMU_INT
              void *arg); // Offset within VM region
@@ -47,6 +48,8 @@ static void vmDestroy(systemArgs *sysargsPtr);
 static void vmDestroyReal(void);
 static  int  Pager(char *);
 
+// added globals
+#define UNIT 1
 
 // added structures
 extern int start5 (char *);
@@ -55,12 +58,19 @@ int faultMboxID;
 int pagersPID[MAXPAGERS]; // pagersID[i] = -1 for i >= acutal # of pagers
 FTE* frameTable;
 int clockHand;
+int writeSize;
+int trackSize;
+DTE* diskTable;
+void *pageBuffer;
 
 // added functions
 int findFreeFrame();
 int findUnreferencedFrame();
 void printFrameTable();
 void printPageTable(int pid);
+void PagerWritesDisk(int frameIndex);
+void PagerReadsDisk(int pid, int pageIndex);
+void printDiskTable();
 
 
 
@@ -223,7 +233,7 @@ vmInitReal(int mappings, int pages, int frames, int pagers)
     // install handler
     USLOSS_IntVec[USLOSS_MMU_INT] = FaultHandler;
 
-
+    
    /*
     * Initialize proc table
     */
@@ -265,13 +275,24 @@ vmInitReal(int mappings, int pages, int frames, int pagers)
      */
     int sector, track, disk;
     diskSizeReal(1, &sector, &track, &disk);
+    
     vmStats.diskBlocks = sector * track * disk / USLOSS_MmuPageSize();
+    writeSize = USLOSS_MmuPageSize() / USLOSS_DISK_SECTOR_SIZE;
+    trackSize = track;
+    
+    diskTable = malloc(vmStats.diskBlocks * sizeof(DTE));
+    for (i = 0; i < vmStats.diskBlocks; i++)
+    {
+        diskTable[i].pid = -1;
+        diskTable[i].page = -1;
+    }
     if (debugflag)
     {
         USLOSS_Console("vmInitReal(): sector %d track %d disk %d\n", sector, track, disk);
         USLOSS_Console("vmInitReal(): disk has %d disk blocks\n", vmStats.diskBlocks);
     }
-    
+    // initialize a page buffer for disk swap
+    pageBuffer = malloc(sizeof(USLOSS_MmuPageSize()));
 
    /*
     * Create the fault mailbox.
@@ -302,6 +323,7 @@ vmInitReal(int mappings, int pages, int frames, int pagers)
     vmStats.freeFrames = frames;
     vmStats.diskBlocks = sector * track * disk / USLOSS_MmuPageSize();
     vmStats.freeDiskBlocks = sector * track * disk / USLOSS_MmuPageSize();
+    vmStats.pageIns = 0;
    /*
     * Initialize other vmStats fields.
     */
@@ -451,6 +473,8 @@ FaultHandler(int  type /* USLOSS_MMU_INT */,
 static int
 Pager(char *buf)
 {
+    int dummy; // for accessing mmu region
+    
     while(1) {
         /* Wait for fault to occur (receive from mailbox) */
         FaultMsg aFaultMsg;
@@ -485,21 +509,38 @@ Pager(char *buf)
             if (debugflag)
                 USLOSS_Console("Pager(): didn't find a free frame\n");
             
-            
             // find an unreferenced frame
             frameIndex = findUnreferencedFrame();
             if (debugflag)
                 USLOSS_Console("Pager(): found unreferenced frame %d\n", frameIndex);
             
-            // write to disk if necessary
             
             // update old page table
             if (debugflag)
                 USLOSS_Console("Pager(): update process %d's page %d\n",
-                           frameTable[frameIndex].pid,
-                           frameTable[frameIndex].page
-                           );
+                               frameTable[frameIndex].pid,
+                               frameTable[frameIndex].page
+                               );
             processes[frameTable[frameIndex].pid].pageTable[frameTable[frameIndex].page].state = UNMAPPED;
+            
+            // write to disk if necessary
+            int accessBit;
+            USLOSS_MmuGetAccess(frameIndex, &accessBit);
+            if (accessBit & USLOSS_MMU_DIRTY)
+            {
+                if (debugflag)
+                    USLOSS_Console("Pager(): need to write to disk\n");
+                
+                PagerWritesDisk(frameIndex);
+                processes[frameTable[frameIndex].pid].pageTable[frameTable[frameIndex].page].state = ONDISK;
+                
+                // update pageOuts
+                vmStats.pageOuts++;
+                if (debugflag)
+                    USLOSS_Console("pageIns %d\n",vmStats.pageOuts);
+                
+            }
+            
             
         }
         
@@ -511,14 +552,25 @@ Pager(char *buf)
                 USLOSS_Console("Pager(): this page is not used yet\n");
             USLOSS_MmuMap(TAG, pageIndex, frameIndex, USLOSS_MMU_PROT_RW);
             int offset = pageIndex * USLOSS_MmuPageSize();
-            int dummy;
+
             // zero out this page
             memset(USLOSS_MmuRegion(&dummy) + offset, '\0', USLOSS_MmuPageSize());
             USLOSS_MmuUnmap(TAG, pageIndex);
         }
-        else
+        else// if (processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].state == ONDISK)
         {
-            // load page into frame from disk if necessary
+            // load page into pageBuffer from disk
+            PagerReadsDisk(aFaultMsg.pid, pageIndex);
+            
+            // copy pageBuffer into frame
+            int offset = pageIndex * USLOSS_MmuPageSize();
+            void *pageAddr = USLOSS_MmuRegion(&dummy) + offset;
+            USLOSS_MmuMap(TAG, pageIndex, frameIndex, USLOSS_MMU_PROT_RW);
+            memcpy(pageAddr, pageBuffer, sizeof(USLOSS_MmuPageSize()));
+            USLOSS_MmuUnmap(TAG, frameTable[frameIndex].page);
+            
+            // update pageIns
+            vmStats.pageIns++;
         }
         
         // set to unreferenced and clean
@@ -540,6 +592,90 @@ Pager(char *buf)
     }
     return 0;
 } /* Pager */
+
+
+
+/*
+ *----------------------------------------------------------------------
+ * PagerWritesDisk
+ *
+ *----------------------------------------------------------------------
+ */
+void PagerReadsDisk(int pid, int pageIndex)
+{
+    if (debugflag)
+        USLOSS_Console("PagerReadsDisk(): reading pid %d's page %d from disk\n", pid, pageIndex);
+    
+    int i;
+    int track, startSector;
+    
+    for (i = 0; i < vmStats.diskBlocks; i++)
+    {
+        if (diskTable[i].pid == pid && diskTable[i].page == pageIndex)
+        {
+            if (debugflag)
+                USLOSS_Console("PagerReadsDisk(): disk slot %d matches\n", i);
+            
+            track = i / 2;
+            startSector = (i % 2) * (i / 2);
+            diskReadReal(UNIT, track, startSector, writeSize, pageBuffer);
+        }
+    }
+    
+    return;
+}
+
+/*
+ *----------------------------------------------------------------------
+ * PagerWritesDisk
+ * 
+ * Side effect:
+ * Disk written, disk table updated, page table updated
+ *----------------------------------------------------------------------
+ */
+void PagerWritesDisk(int frameIndex)
+{
+    if (debugflag)
+        USLOSS_Console("PagerWritesDisk(): writing to a disk");
+    
+    
+    int dummy;
+    
+    int offset = frameTable[frameIndex].page * USLOSS_MmuPageSize();
+    void *pageAddr = USLOSS_MmuRegion(&dummy) + offset;
+    
+    // copy current frame to a global buffer
+    USLOSS_MmuMap(TAG, frameTable[frameIndex].page, frameIndex, USLOSS_MMU_PROT_RW);
+    memcpy(pageBuffer, pageAddr, sizeof(USLOSS_MmuPageSize()));
+    USLOSS_MmuUnmap(TAG, frameTable[frameIndex].page);
+    
+    
+    // find which block to use
+    int i, diskSlot;
+    for (i = 0; i < vmStats.diskBlocks; i++)
+    {
+        if (diskTable[i].pid == -1)
+        {
+            // update page table
+            diskSlot = i;
+            diskTable[i].pid = frameTable[frameIndex].pid;
+            diskTable[i].page = frameTable[frameIndex].page;
+            break;
+        }
+    }
+    if (debugflag)
+        USLOSS_Console("PagerWritesDisk(): found disk slot %d\n", diskSlot);
+    
+    // convert block index to track and start sector
+    int track = diskSlot / 2;
+    int startSector = (diskSlot % 2) * (trackSize / 2);
+    if (debugflag)
+        USLOSS_Console("PagerWritesDisk(): going to write on disk %d track %d start %d\n", UNIT, track, startSector);
+    
+    diskWriteReal(UNIT, track, startSector, writeSize, pageBuffer);
+    
+}
+
 
 
 /*
@@ -644,5 +780,22 @@ void printPageTable(int pid)
                        processes[pid % MAXPROC].pageTable[i].state
                        );
         
+    }
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ * printDiskTable
+ *----------------------------------------------------------------------
+ */
+void printDiskTable()
+{
+    USLOSS_Console("printDiskTable():\n");
+    int i;
+    for (i = 0; i < vmStats.diskBlocks; i++)
+    {
+        if (diskTable[i].pid != -1)
+            USLOSS_Console("\tdisk slot %d pid %d page %d\n", i, diskTable[i].pid, diskTable[i].page);
     }
 }
