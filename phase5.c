@@ -265,9 +265,6 @@ vmInitReal(int mappings, int pages, int frames, int pagers)
     {
         frameTable[i].pid = -1;
         frameTable[i].page = -1;
-        frameTable[i].referenced = 0;
-        frameTable[i].clean = 1;
-        frameTable[i].state = UNUSED;
     }
     
     /*
@@ -285,6 +282,7 @@ vmInitReal(int mappings, int pages, int frames, int pagers)
     {
         diskTable[i].pid = -1;
         diskTable[i].page = -1;
+        diskTable[i].state = SLOT_UNUSED;
     }
     if (debugflag)
     {
@@ -500,7 +498,7 @@ Pager(char *buf)
             if (debugflag)
                 USLOSS_Console("Pager(): found free frame %d\n", frameIndex);
             vmStats.freeFrames--;
-        }
+        } /* end of Look for free frame */
         
         /* If there isn't one then use clock algorithm to
          * replace a page (perhaps write to disk) */
@@ -521,30 +519,32 @@ Pager(char *buf)
                                frameTable[frameIndex].pid,
                                frameTable[frameIndex].page
                                );
-            processes[frameTable[frameIndex].pid].pageTable[frameTable[frameIndex].page].state = UNMAPPED;
             
-            // write to disk if necessary
+            // write old page to disk if necessary
             int accessBit;
             USLOSS_MmuGetAccess(frameIndex, &accessBit);
             if (accessBit & USLOSS_MMU_DIRTY)
             {
                 if (debugflag)
                     USLOSS_Console("Pager(): need to write to disk\n");
-                
                 PagerWritesDisk(frameIndex);
+                if (processes[frameTable[frameIndex].pid].pageTable[frameTable[frameIndex].page].state != INCORE_ONDISK)
+                    vmStats.freeDiskBlocks--;
                 processes[frameTable[frameIndex].pid].pageTable[frameTable[frameIndex].page].state = ONDISK;
                 
                 // update pageOuts
                 vmStats.pageOuts++;
                 if (debugflag)
-                    USLOSS_Console("pageIns %d\n",vmStats.pageOuts);
+                    USLOSS_Console("pageOuts %d\n",vmStats.pageOuts);
                 
             }
+            else
+                processes[frameTable[frameIndex].pid].pageTable[frameTable[frameIndex].page].state = USED;
             
             
-        }
+        } // end of using clock algorithm
         
-        // if this page is not touched yet
+        // if this new page is not touched yet
         if (processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].state == UNUSED)
         {
             vmStats.new++;
@@ -557,7 +557,7 @@ Pager(char *buf)
             memset(USLOSS_MmuRegion(&dummy) + offset, '\0', USLOSS_MmuPageSize());
             USLOSS_MmuUnmap(TAG, pageIndex);
         }
-        else// if (processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].state == ONDISK)
+        else if (processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].state == ONDISK)
         {
             // load page into pageBuffer from disk
             PagerReadsDisk(aFaultMsg.pid, pageIndex);
@@ -579,15 +579,18 @@ Pager(char *buf)
         /* Update frame table, new page table and process table */
         frameTable[frameIndex].pid = aFaultMsg.pid;
         frameTable[frameIndex].page = pageIndex;
-        frameTable[frameIndex].referenced = 0;
-        frameTable[frameIndex].clean = 1;
-        frameTable[frameIndex].state = INCORE;
-        processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].state = INCORE;
+        if (processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].state == ONDISK)
+            processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].state = INCORE_ONDISK;
+        else
+            processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].state = INCORE;
         processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].frame = frameIndex;
         processes[aFaultMsg.pid % MAXPROC].numPages++;
         
+        //debug
+        //printPageTable(aFaultMsg.pid % MAXPROC);
         /* Unblock waiting (faulting) process */
         MboxSend(aFaultMsg.replyMbox, NULL, 0);
+        
         
     }
     return 0;
@@ -619,8 +622,11 @@ void PagerReadsDisk(int pid, int pageIndex)
             track = i / 2;
             startSector = (i % 2) * (i / 2);
             diskReadReal(UNIT, track, startSector, writeSize, pageBuffer);
+            break;
         }
+        
     }
+    
     
     return;
 }
@@ -654,9 +660,10 @@ void PagerWritesDisk(int frameIndex)
     int i, diskSlot;
     for (i = 0; i < vmStats.diskBlocks; i++)
     {
-        if (diskTable[i].pid == -1)
+        if (diskTable[i].state == SLOT_UNUSED)
         {
             // update page table
+            diskTable[i].state = SLOT_USED;
             diskSlot = i;
             diskTable[i].pid = frameTable[frameIndex].pid;
             diskTable[i].page = frameTable[frameIndex].page;
@@ -673,6 +680,7 @@ void PagerWritesDisk(int frameIndex)
         USLOSS_Console("PagerWritesDisk(): going to write on disk %d track %d start %d\n", UNIT, track, startSector);
     
     diskWriteReal(UNIT, track, startSector, writeSize, pageBuffer);
+    
     
 }
 
@@ -695,9 +703,7 @@ int findFreeFrame()
     int i, accessBit;
     for (i = 0; i < vmStats.frames; i++)
     {
-        if (debugflag)
-            USLOSS_Console("findFreeFrame(): slot %d in frameTable has state %d\n", i, frameTable[i].state);
-        if (frameTable[i].state == UNUSED)
+        if (frameTable[i].pid == -1)
         {
             USLOSS_MmuGetAccess(i, &accessBit);
             if (debugflag)
@@ -757,8 +763,8 @@ void printFrameTable()
     for (i = 0; i < vmStats.frames; i++)
     {
         USLOSS_MmuGetAccess(i, &accessBit);
-        USLOSS_Console("\tprintFrameTable(): frame %d pid %d page %d ref %d clean %d state %d\n",
-                       i, frameTable[i].pid, frameTable[i].page, accessBit & USLOSS_MMU_REF, frameTable[i].clean, frameTable[i].state);
+        USLOSS_Console("\tprintFrameTable(): frame %d pid %d page %d\n",
+                       i, frameTable[i].pid, frameTable[i].page, accessBit & USLOSS_MMU_REF);
     }
 }
 

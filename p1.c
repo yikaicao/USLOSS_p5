@@ -24,7 +24,7 @@ p1_fork(int pid)
 void
 p1_switch(int old, int new)
 {
-    if (DEBUG && debugflag)
+    if (DEBUG && debugflag) 
         USLOSS_Console("p1_switch() called: old = %d, new = %d\n", old, new);
     
     if (DEBUG && debugflag)

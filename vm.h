@@ -13,7 +13,8 @@
 #define UNUSED 500
 #define INCORE 501
 #define ONDISK 502
-#define UNMAPPED 503
+#define INCORE_ONDISK 503
+#define USED 504 // not unused, not incore, not ondisk
 /* You'll probably want more states */
 
 
@@ -33,9 +34,6 @@ typedef struct PTE {
 typedef struct FTE {
     int pid;    // which child process is using this frame
     int page;   // which page in a child process's page table is mapped to this entry
-    int referenced;
-    int clean;
-    int state;
 } FTE;
 
 /*
@@ -44,8 +42,10 @@ typedef struct FTE {
 typedef struct DTE {
     int pid;
     int page;
+    int state;
 } DTE;
-
+#define SLOT_USED 504
+#define SLOT_UNUSED 505
 
 /*
  * Per-process information.
