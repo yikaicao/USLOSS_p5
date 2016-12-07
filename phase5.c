@@ -50,6 +50,7 @@ static  int  Pager(char *);
 
 // added globals
 #define UNIT 1
+int debugflag9 = 0;
 
 // added structures
 extern int start5 (char *);
@@ -265,6 +266,7 @@ vmInitReal(int mappings, int pages, int frames, int pagers)
     {
         frameTable[i].pid = -1;
         frameTable[i].page = -1;
+        frameTable[i].locked = 0;
     }
     
     /*
@@ -447,9 +449,16 @@ FaultHandler(int  type /* USLOSS_MMU_INT */,
     faults[pid % MAXPROC].addr = arg;
     faults[pid % MAXPROC].replyMbox = processes[pid % MAXPROC].privateMboxID;
     
+    
+    if (debugflag9)
+    USLOSS_Console("\tFaultHandler(): blocking %d\n", pid);
     MboxSend(faultMboxID, &faults[pid % MAXPROC], sizeof(FaultMsg));
     
+    
     MboxReceive(processes[pid % MAXPROC].privateMboxID, NULL, 0);
+    if (debugflag9)
+    USLOSS_Console("\tFaultHandler(): %d unblocked\n", pid);
+    
     
 } /* FaultHandler */
 
@@ -472,7 +481,7 @@ static int
 Pager(char *buf)
 {
     int dummy; // for accessing mmu region
-    
+    int clockHandMbox = MboxCreate(1, 0);
     while(1) {
         /* Wait for fault to occur (receive from mailbox) */
         FaultMsg aFaultMsg;
@@ -508,6 +517,7 @@ Pager(char *buf)
                 USLOSS_Console("Pager(): didn't find a free frame\n");
             
             // find an unreferenced frame
+            MboxSend(clockHandMbox, NULL, 0);
             frameIndex = findUnreferencedFrame();
             if (debugflag)
                 USLOSS_Console("Pager(): found unreferenced frame %d\n", frameIndex);
@@ -586,11 +596,13 @@ Pager(char *buf)
         processes[aFaultMsg.pid % MAXPROC].pageTable[pageIndex].frame = frameIndex;
         processes[aFaultMsg.pid % MAXPROC].numPages++;
         
-        //debug
-        //printPageTable(aFaultMsg.pid % MAXPROC);
+        if (debugflag9){
+        printPageTable(aFaultMsg.pid % MAXPROC);
+        printFrameTable();
+        }
         /* Unblock waiting (faulting) process */
+        MboxCondReceive(clockHandMbox, NULL, 0);
         MboxSend(aFaultMsg.replyMbox, NULL, 0);
-        
         
     }
     return 0;
@@ -624,9 +636,7 @@ void PagerReadsDisk(int pid, int pageIndex)
             diskReadReal(UNIT, track, startSector, writeSize, pageBuffer);
             break;
         }
-        
     }
-    
     
     return;
 }
@@ -708,7 +718,9 @@ int findFreeFrame()
             USLOSS_MmuGetAccess(i, &accessBit);
             if (debugflag)
                 USLOSS_Console("findFreeFrame(): ref = %d\n", accessBit & USLOSS_MMU_REF);
-            
+//            
+//            if (i == vmStats.frames - 1)
+//                frameTable[i].locked = 1;
             return i;
         }
     }
@@ -728,7 +740,6 @@ int findUnreferencedFrame()
 {
     int accessBit;
     
-    // iterate two times of frames at most
     for (;; clockHand = (clockHand + 1) % vmStats.frames)
     {
         // get access bit
@@ -743,10 +754,13 @@ int findUnreferencedFrame()
             // set to unreferenced
             USLOSS_MmuSetAccess(clockHand % vmStats.frames, accessBit);
         }
-        else
+        else if (frameTable[clockHand % vmStats.frames].locked == 0)
         {
+            frameTable[clockHand % vmStats.frames].locked = 1;
             return clockHand % vmStats.frames;
         }
+        else
+            frameTable[clockHand % vmStats.frames].locked = 0;
     }
     return -1;
 }
@@ -759,12 +773,14 @@ int findUnreferencedFrame()
  */
 void printFrameTable()
 {
+    USLOSS_Console("\tprintFrameTable():\n");
+    
     int i, accessBit;
     for (i = 0; i < vmStats.frames; i++)
     {
         USLOSS_MmuGetAccess(i, &accessBit);
-        USLOSS_Console("\tprintFrameTable(): frame %d pid %d page %d\n",
-                       i, frameTable[i].pid, frameTable[i].page, accessBit & USLOSS_MMU_REF);
+        USLOSS_Console("\t\tframe %d pid %d page %d locked %d\n",
+                       i, frameTable[i].pid, frameTable[i].page, frameTable[i].locked);
     }
 }
 

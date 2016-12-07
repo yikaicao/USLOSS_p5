@@ -34,6 +34,7 @@ typedef struct PTE {
 typedef struct FTE {
     int pid;    // which child process is using this frame
     int page;   // which page in a child process's page table is mapped to this entry
+    int locked;
 } FTE;
 
 /*
